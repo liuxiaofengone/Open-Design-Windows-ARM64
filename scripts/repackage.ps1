@@ -27,7 +27,9 @@ function Download-File {
         [string]$Url,
         [string]$OutPath,
         [bool]$UseProxy,
-        [int]$ProxyPort
+        [int]$ProxyPort,
+        [int]$MaxRetries = 10,
+        [int]$ConnectTimeout = 15
     )
     if (Test-Path $OutPath) {
         Write-Host "[缓存命中] $OutPath" -ForegroundColor Gray
@@ -45,7 +47,7 @@ function Download-File {
         $curlArgs += "http://127.0.0.1:$ProxyPort"
     }
     $curlArgs += "--connect-timeout"
-    $curlArgs += "15"
+    $curlArgs += "$ConnectTimeout"
     $curlArgs += "--max-time"
     $curlArgs += "300"
     $curlArgs += "-C"
@@ -60,15 +62,17 @@ function Download-File {
     $curlArgs += "`"$Url`""
 
     $success = $false
-    for ($i = 1; $i -le 10; $i++) {
-        Write-Host "正在下载 $Url -> 尝试 $i/10..."
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        Write-Host "正在下载 $Url -> 尝试 $i/$MaxRetries..."
         $process = Start-Process -FilePath "C:\Windows\System32\curl.exe" -ArgumentList $curlArgs -Wait -NoNewWindow -PassThru
         if ($process.ExitCode -eq 0) {
             $success = $true
             break
         } else {
             Write-Warning "下载尝试 $i 失败，错误码 $($process.ExitCode)。"
-            Start-Sleep -Seconds 3
+            if ($i -lt $MaxRetries) {
+                Start-Sleep -Seconds 3
+            }
         }
     }
     if (!$success) {
@@ -223,6 +227,7 @@ try {
 
 # 4. Construct asset URLs
 $x64PortableUrl = "$($gitHubPrefix)https://github.com/nexu-io/open-design/releases/download/$tag/open-design-$VERSION-win-x64-portable.zip"
+$x64SetupUrl = "$($gitHubPrefix)https://github.com/nexu-io/open-design/releases/download/$tag/open-design-$VERSION-win-x64-setup.exe"
 $electronArm64Url = "$($gitHubPrefix)https://github.com/electron/electron/releases/download/v$ELECTRON_VERSION/electron-v$ELECTRON_VERSION-win32-arm64.zip"
 $betterSqliteUrl = "$($gitHubPrefix)https://github.com/WiseLibs/better-sqlite3/releases/download/v$BETTER_SQLITE3_VERSION/better-sqlite3-v$BETTER_SQLITE3_VERSION-electron-v145-win32-arm64.tar.gz"
 $nodePtyNpmUrl = "https://registry.npmmirror.com/node-pty/-/node-pty-$NODE_PTY_VERSION.tgz"
@@ -231,6 +236,7 @@ $iconUrl = "https://cdn.jsdelivr.net/gh/nexu-io/open-design@$tag/tools/pack/reso
 
 # Cache paths
 $cachedX64Zip = Join-Path $CACHE_DIR "open-design-$VERSION-win-x64-portable.zip"
+$cachedX64Setup = Join-Path $CACHE_DIR "open-design-$VERSION-win-x64-setup.exe"
 $cachedElectronZip = Join-Path $CACHE_DIR "electron-v$ELECTRON_VERSION-win32-arm64.zip"
 $cachedBetterSqliteTgz = Join-Path $CACHE_DIR "better-sqlite3-v$BETTER_SQLITE3_VERSION-electron-v145-win32-arm64.tar.gz"
 $cachedPtyTgz = Join-Path $CACHE_DIR "node-pty-$NODE_PTY_VERSION.tgz"
@@ -239,7 +245,25 @@ $cachedIconIco = Join-Path $CACHE_DIR "icon.ico"
 
 # 5. Download Assets
 Write-Host "`n--- 正在下载打包所需资源 ---" -ForegroundColor Cyan
-Download-File -Url $x64PortableUrl -OutPath $cachedX64Zip -UseProxy $useProxy -ProxyPort $proxyPort
+
+$downloadedZip = $true
+if (Test-Path $cachedX64Zip) {
+    Write-Host "[缓存命中] $cachedX64Zip" -ForegroundColor Gray
+} elseif (Test-Path $cachedX64Setup) {
+    Write-Host "[缓存命中] $cachedX64Setup" -ForegroundColor Gray
+    $downloadedZip = $false
+} else {
+    try {
+        Write-Host "尝试下载 x64 绿色版便携 ZIP 包..." -ForegroundColor Gray
+        # 使用 1 次尝试和短超时来判断 ZIP 是否存在，不存在则快速切换到安装包
+        Download-File -Url $x64PortableUrl -OutPath $cachedX64Zip -UseProxy $useProxy -ProxyPort $proxyPort -MaxRetries 1 -ConnectTimeout 3
+    } catch {
+        Write-Warning "下载 x64 绿色版便携 ZIP 失败，将尝试下载 Setup 安装程序并进行本地解包..."
+        $downloadedZip = $false
+        Download-File -Url $x64SetupUrl -OutPath $cachedX64Setup -UseProxy $useProxy -ProxyPort $proxyPort -MaxRetries 5
+    }
+}
+
 Download-File -Url $electronArm64Url -OutPath $cachedElectronZip -UseProxy $useProxy -ProxyPort $proxyPort
 Download-File -Url $betterSqliteUrl -OutPath $cachedBetterSqliteTgz -UseProxy $useProxy -ProxyPort $proxyPort
 Download-File -Url $nodePtyNpmUrl -OutPath $cachedPtyTgz -UseProxy $false -ProxyPort 0 # No proxy needed for npmmirror
@@ -248,7 +272,73 @@ Download-File -Url $iconUrl -OutPath $cachedIconIco -UseProxy $false -ProxyPort 
 
 # 6. Extract Archives
 Write-Host "`n--- 正在解压并释放资源 ---" -ForegroundColor Cyan
-Extract-Archive -ArchivePath $cachedX64Zip -TargetDir $UNPACK_X64_DIR
+
+if (Test-Path $UNPACK_X64_DIR) {
+    Remove-Item $UNPACK_X64_DIR -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+}
+New-Item -ItemType Directory -Force -Path $UNPACK_X64_DIR | Out-Null
+
+if ($downloadedZip) {
+    Extract-Archive -ArchivePath $cachedX64Zip -TargetDir $UNPACK_X64_DIR
+} else {
+    # We must extract the NSIS setup exe using 7z
+    Write-Host "检测到安装程序，正在使用 7z 解包第一层 (Installer)..." -ForegroundColor Gray
+    $has7z = Get-Command "7z" -ErrorAction SilentlyContinue
+    $path7z = "7z"
+    if (!$has7z) {
+        $standardPaths = @(
+            "C:\Program Files\7-Zip\7z.exe",
+            "C:\Program Files\NanaZip\NanaZipC.exe"
+        )
+        foreach ($p in $standardPaths) {
+            if (Test-Path $p) {
+                $path7z = $p
+                $has7z = $true
+                break
+            }
+        }
+    }
+    if (!$has7z) {
+        throw "本地系统未找到 7z 命令行工具，请先安装 7-Zip 或 NanaZip 并将其加入环境变量 PATH！"
+    }
+    
+    $unpackTmp = Join-Path $WORK_DIR "installer-unpack"
+    if (Test-Path $unpackTmp) {
+        Remove-Item $unpackTmp -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    New-Item -ItemType Directory -Force -Path $unpackTmp | Out-Null
+    
+    $args7z = @("x", "`"$cachedX64Setup`"", "-o`"$unpackTmp`"", "-y")
+    $p7z = Start-Process -FilePath $path7z -ArgumentList $args7z -Wait -NoNewWindow -PassThru
+    if ($p7z.ExitCode -ne 0) {
+        throw "使用 7z 解压安装包失败！退出代码: $($p7z.ExitCode)"
+    }
+    
+    $pluginsDir = Join-Path $unpackTmp "`$PLUGINSDIR"
+    $payloadBase = Join-Path $pluginsDir "payload-base.7z"
+    $payloadOverlay = Join-Path $pluginsDir "payload-overlay.7z"
+    
+    if (!(Test-Path $payloadBase) -or !(Test-Path $payloadOverlay)) {
+        throw "在解开的安装包中未找到核心载荷文件 payload-base.7z 或 payload-overlay.7z！"
+    }
+    
+    Write-Host "正在使用 7z 解包并合并第二层 (payload-base.7z)..." -ForegroundColor Gray
+    $argsBase = @("x", "`"$payloadBase`"", "-o`"$UNPACK_X64_DIR`"", "-y")
+    $pBase = Start-Process -FilePath $path7z -ArgumentList $argsBase -Wait -NoNewWindow -PassThru
+    if ($pBase.ExitCode -ne 0) {
+        throw "使用 7z 解压缩 payload-base.7z 失败！"
+    }
+    
+    Write-Host "正在使用 7z 解包并合并第二层 (payload-overlay.7z)..." -ForegroundColor Gray
+    $argsOverlay = @("x", "`"$payloadOverlay`"", "-o`"$UNPACK_X64_DIR`"", "-y")
+    $pOverlay = Start-Process -FilePath $path7z -ArgumentList $argsOverlay -Wait -NoNewWindow -PassThru
+    if ($pOverlay.ExitCode -ne 0) {
+        throw "使用 7z 解压缩 payload-overlay.7z 失败！"
+    }
+    
+    Write-Host "安装包双层解包并合并成功！" -ForegroundColor Green
+}
+
 Extract-Archive -ArchivePath $cachedElectronZip -TargetDir $UNPACK_ELECTRON_DIR
 Extract-Archive -ArchivePath $cachedBetterSqliteTgz -TargetDir $UNPACK_BETTER_SQLITE3_DIR
 Extract-Archive -ArchivePath $cachedPtyTgz -TargetDir $UNPACK_PTY_DIR
@@ -321,15 +411,31 @@ if (Test-Path $OUTPUT_ZIP) {
     Remove-Item $OUTPUT_ZIP -Force
 }
 
-# Run native tar.exe to create zip
-$tarArgs = @("-acf", "`"$OUTPUT_ZIP`"", "*")
-$zipProcess = Start-Process -FilePath "C:\Windows\System32\tar.exe" -ArgumentList $tarArgs -WorkingDirectory $ASSEMBLED_DIR -Wait -NoNewWindow -PassThru
+# Run 7z or native tar.exe to create zip
+$zipSuccess = $false
+if ($has7z) {
+    Write-Host "检测到 7z，正在使用 7z 进行多线程快速压缩..." -ForegroundColor Gray
+    $zipArgs = @("a", "-tzip", "-mx3", "`"$OUTPUT_ZIP`"", "*")
+    $zipProcess = Start-Process -FilePath $path7z -ArgumentList $zipArgs -WorkingDirectory $ASSEMBLED_DIR -Wait -NoNewWindow -PassThru
+    if ($zipProcess.ExitCode -eq 0) {
+        $zipSuccess = $true
+    }
+}
 
-if ($zipProcess.ExitCode -eq 0) {
+if (!$zipSuccess) {
+    Write-Host "未检测到 7z 或压缩失败，正在使用系统自带 tar.exe 进行单线程压缩..." -ForegroundColor Gray
+    $tarArgs = @("-acf", "`"$OUTPUT_ZIP`"", "*")
+    $zipProcess = Start-Process -FilePath "C:\Windows\System32\tar.exe" -ArgumentList $tarArgs -WorkingDirectory $ASSEMBLED_DIR -Wait -NoNewWindow -PassThru
+    if ($zipProcess.ExitCode -eq 0) {
+        $zipSuccess = $true
+    }
+}
+
+if ($zipSuccess) {
     Write-Host "`n===================================================" -ForegroundColor Green
     Write-Host "   Windows ARM64 绿色版便携归档制作完成！" -ForegroundColor Green
     Write-Host "   目标路径: $OUTPUT_ZIP" -ForegroundColor Green
     Write-Host "===================================================" -ForegroundColor Green
 } else {
-    throw "使用 tar.exe 进行成果包压缩失败！"
+    throw "打包压缩失败！"
 }
