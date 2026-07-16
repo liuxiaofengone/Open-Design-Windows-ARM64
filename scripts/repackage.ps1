@@ -32,8 +32,14 @@ function Download-File {
         [int]$ConnectTimeout = 15
     )
     if (Test-Path $OutPath) {
-        Write-Host "[缓存命中] $OutPath" -ForegroundColor Gray
-        return
+        $size = (Get-Item $OutPath).Length
+        if ($size -ge 1024) {
+            Write-Host "[缓存命中] $OutPath" -ForegroundColor Gray
+            return
+        } else {
+            Write-Warning "缓存文件大小异常 ($size 字节)，将清除并重新下载：$OutPath"
+            Remove-Item $OutPath -Force
+        }
     }
     $parent = Split-Path $OutPath -Parent
     if (!(Test-Path $parent)) {
@@ -46,6 +52,7 @@ function Download-File {
         $curlArgs += "--proxy"
         $curlArgs += "http://127.0.0.1:$ProxyPort"
     }
+    $curlArgs += "--fail"
     $curlArgs += "--connect-timeout"
     $curlArgs += "$ConnectTimeout"
     $curlArgs += "--max-time"
@@ -247,9 +254,29 @@ $cachedIconIco = Join-Path $CACHE_DIR "icon.ico"
 Write-Host "`n--- 正在下载打包所需资源 ---" -ForegroundColor Cyan
 
 $downloadedZip = $true
+$hasValidZipCache = $false
 if (Test-Path $cachedX64Zip) {
+    if ((Get-Item $cachedX64Zip).Length -ge 1024) {
+        $hasValidZipCache = $true
+    } else {
+        Write-Warning "缓存的 ZIP 文件损坏或大小异常，将清除并重新下载。"
+        Remove-Item $cachedX64Zip -Force
+    }
+}
+
+$hasValidSetupCache = $false
+if (Test-Path $cachedX64Setup) {
+    if ((Get-Item $cachedX64Setup).Length -ge 1024) {
+        $hasValidSetupCache = $true
+    } else {
+        Write-Warning "缓存的 EXE 安装包文件损坏或大小异常，将清除并重新下载。"
+        Remove-Item $cachedX64Setup -Force
+    }
+}
+
+if ($hasValidZipCache) {
     Write-Host "[缓存命中] $cachedX64Zip" -ForegroundColor Gray
-} elseif (Test-Path $cachedX64Setup) {
+} elseif ($hasValidSetupCache) {
     Write-Host "[缓存命中] $cachedX64Setup" -ForegroundColor Gray
     $downloadedZip = $false
 } else {
